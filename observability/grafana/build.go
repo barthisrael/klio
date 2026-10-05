@@ -56,27 +56,36 @@ func build() *dashboard.DashboardBuilder {
 			labelVariable("namespace", "Namespace",
 				`label_values({__name__=~"klio_.+"}, k8s_namespace_name)`),
 		).
+		// Server identity is the OpenTelemetry service.name, not the pod
+		// host_name: two Servers with the same name in different namespaces
+		// share a host_name (e.g. both "klio-a-klio-0") and would collapse into
+		// one ambiguous entry, whereas their service.name stays distinct.
 		WithVariable(
 			labelVariable("server", "Server",
-				`label_values(klio_server_uptime_seconds{k8s_namespace_name=~"$namespace"}, host_name)`),
+				`label_values(klio_server_uptime_seconds, service_name)`),
 		).
+		// The cluster list is narrowed by the selected server (service.name),
+		// NOT by namespace: a server tags its series with its own namespace, so
+		// filtering clusters by $namespace would drop clusters served
+		// cross-namespace.
 		WithVariable(
 			labelVariable("cluster", "Cluster",
-				`label_values(klio_server_wal_written_total{k8s_namespace_name=~"$namespace",host_name=~"$server"}, cluster_name)`),
+				`label_values(klio_server_wal_written_total{service_name=~"$server"}, cluster_name)`),
 		)
 
 	y := 0
 	layoutSection(builder, &y, "Client / Plugin", clientPanels())
 	layoutSection(builder, &y, "Server", serverPanels())
-	layoutSection(builder, &y, "WAL Replication Lag", replicationPanels())
+	layoutSection(builder, &y, "WAL replication lag", replicationPanels())
 
 	return builder
 }
 
 // layoutSection adds a row header at the current y offset, then packs the
-// panels into a dense grid: each grid row is filled to the full 24-column width
-// (slack is distributed across the row's panels) so there are no empty gaps
-// between panels. y is advanced past the section.
+// panels into a dense grid: each grid row is filled to the full 24-column
+// width (slack is distributed across the row's panels) so there are no empty
+// gaps between panels. Widths that add up to 24 are used as they are. y is
+// advanced past the section.
 func layoutSection(builder *dashboard.DashboardBuilder, y *int, title string, panels []sizedPanel) {
 	builder.WithRow(dashboard.NewRowBuilder(title).
 		GridPos(dashboard.GridPos{X: 0, Y: uint32(*y), W: 24, H: 1})) //nolint:gosec // small positive ints
