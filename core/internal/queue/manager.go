@@ -511,6 +511,9 @@ func (m *StreamManager) purgeDLQEntryBySequence(
 
 		return fmt.Errorf("while fetching dead-letter queue entry at sequence %d: %w", dlqSeq, err)
 	}
+	if advisoryMsg == nil {
+		return fmt.Errorf("while fetching dead-letter queue entry at sequence %d: %w", dlqSeq, errAmbiguousSourceRead)
+	}
 
 	var advisory server.JSConsumerDeliveryExceededAdvisory
 	if err := json.Unmarshal(advisoryMsg.Data, &advisory); err != nil {
