@@ -38,16 +38,19 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/cloudnative-pg/klio/core/internal/client/klioclient/grpcclient"
+	"github.com/cloudnative-pg/klio/core/internal/opentelemetry"
 	"github.com/cloudnative-pg/klio/core/pkg/config"
 )
 
 var errWALNotFound = errors.New("wal not found")
 
-type tier string
+// tier aliases opentelemetry.Tier so the `tier` attribute on the restore
+// metric and the tier the plugin restores from share a single definition.
+type tier = opentelemetry.Tier
 
 const (
-	tier1 tier = "tier1"
-	tier2 tier = "tier2"
+	tier1 = opentelemetry.Tier1
+	tier2 = opentelemetry.Tier2
 )
 
 type walServiceImplementation struct {
@@ -97,6 +100,20 @@ func (w *walServiceImplementation) Restore(
 	walName := request.GetSourceWalName()
 	destinationPath := request.GetDestinationFileName()
 
+	// Record the end-to-end restore duration on every exit path. The
+	// closure reads the final values of outcome/clusterName, so failures —
+	// including the fast validation bail-outs below — are measured too. The
+	// result starts as a failure so a bail-out that never reaches restoreWAL
+	// is counted as one.
+	var (
+		outcome     restoreOutcome
+		clusterName string
+	)
+	outcome.result = opentelemetry.OutcomeFailure
+	defer func() {
+		recordWalRestore(ctx, time.Since(startCall), outcome, clusterName)
+	}()
+
 	if walName == "" || destinationPath == "" {
 		contextLogger.Warning("WAL restore operation failed. WAL name and destination file name must be specified")
 		return nil, errors.New("source WAL name and destination file name must be provided")
@@ -107,6 +124,7 @@ func (w *walServiceImplementation) Restore(
 	if err := json.Unmarshal(request.GetClusterDefinition(), &cluster); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal cluster definition: %w", err)
 	}
+	clusterName = cluster.Name
 	podName, ok := os.LookupEnv("POD_NAME") // Ensure PODNAME is set in the environment
 	if !ok {
 		return nil, errors.New("POD_NAME environment variable is not set")
@@ -120,8 +138,9 @@ func (w *walServiceImplementation) Restore(
 		return nil, errors.New("no WAL repository found for the cluster")
 	}
 
-	err = w.restoreWAL(ctx, walName, destinationPath, confPath)
-	if errors.Is(err, errWALNotFound) {
+	outcome, err = w.restoreWAL(ctx, walName, destinationPath, confPath)
+	outcome.result = restoreResult(err)
+	if outcome.result == opentelemetry.OutcomeNotFound {
 		return &wal.WALRestoreResult{}, status.Errorf(codes.NotFound, "WAL file not found: %q", walName)
 	}
 	if err != nil {
@@ -133,19 +152,53 @@ func (w *walServiceImplementation) Restore(
 	return &wal.WALRestoreResult{}, nil
 }
 
+// restoreResult classifies a restoreWAL error for the `outcome` attribute of
+// the restore duration metric. Callers branch on the returned Outcome rather
+// than re-testing the error, so this stays the only definition of "not found"
+// and nothing derived from it can disagree.
+//
+// `not_found` is deliberately not a failure. PostgreSQL routinely asks for a
+// segment or a timeline history file that was never archived, and that absence
+// is how it learns it has reached the end of the archive. CloudNativePG
+// collects every plugin error the same way and never inspects the gRPC code, so
+// this attribute is the only place the distinction survives; folding it into
+// `failure` would report a constant failure rate on a healthy cluster.
+func restoreResult(err error) opentelemetry.Outcome {
+	switch {
+	case err == nil:
+		return opentelemetry.OutcomeSuccess
+	case errors.Is(err, errWALNotFound):
+		return opentelemetry.OutcomeNotFound
+	default:
+		return opentelemetry.OutcomeFailure
+	}
+}
+
+// restoreOutcome carries what Restore tags its end-to-end duration metric
+// with: the facts only known deep in the restore path, which restoreWAL
+// returns, plus the result Restore classifies from the restore error. On
+// failure the former hold whatever was known so far (tier is the one that
+// failed, or empty when none was tried or none held the WAL; cacheHit is
+// false).
+type restoreOutcome struct {
+	tier     tier
+	cacheHit bool
+	result   opentelemetry.Outcome
+}
+
 func (w *walServiceImplementation) restoreWAL(
 	ctx context.Context,
 	walName, destinationPath string,
 	configPath string,
-) error {
+) (restoreOutcome, error) {
 	cfg, err := config.NewFromFile(afero.NewOsFs(), configPath)
 	if err != nil {
-		return fmt.Errorf("while loading configuration from file %q: %w", configPath, err)
+		return restoreOutcome{}, fmt.Errorf("while loading configuration from file %q: %w", configPath, err)
 	}
 
 	tiers := availableTiers(cfg)
 	if len(tiers) == 0 {
-		return errors.New("no WAL tier configured")
+		return restoreOutcome{}, errors.New("no WAL tier configured")
 	}
 
 	// Try the previously-successful tier first, when both are available.
@@ -155,20 +208,22 @@ func (w *walServiceImplementation) restoreWAL(
 	}
 
 	for _, t := range tiers {
-		err := w.mgr.restoreWAL(ctx, walRestoreOptions{
+		cacheHit, err := w.mgr.restoreWAL(ctx, walRestoreOptions{
 			configFile: configPath,
 			targetTier: t,
 		}, walName, destinationPath)
 		if err == nil {
 			w.currentTier.Store(t)
-			return nil
+			return restoreOutcome{tier: t, cacheHit: cacheHit}, nil
 		}
 		if !errors.Is(err, errWALNotFound) {
-			return err
+			return restoreOutcome{tier: t}, err
 		}
 	}
 
-	return errWALNotFound
+	// No tier served the WAL, so none is reported: naming the last one tried
+	// would split not_found restores across tiers by try order.
+	return restoreOutcome{}, errWALNotFound
 }
 
 // availableTiers returns the tiers the user has opted in to as recovery
@@ -297,15 +352,18 @@ func (mgr *grpcClientManager) setupSpoolDir(ctx context.Context, opts walRestore
 	return spoolDir, nil
 }
 
+// restoreWAL restores a single WAL file via the given tier's client. The
+// returned bool reports whether the file was served from the prefetch spool
+// (a cache hit); it is only meaningful when the error is nil.
 func (mgr *grpcClientManager) restoreWAL(
 	ctx context.Context,
 	opts walRestoreOptions,
 	walName string,
 	targetFileName string,
-) error {
+) (bool, error) {
 	client, err := mgr.getClient(ctx, opts)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	return client.prefetcher.Request(ctx, walName, targetFileName)

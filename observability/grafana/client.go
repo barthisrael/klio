@@ -26,18 +26,28 @@ import (
 	"github.com/grafana/grafana-foundation-sdk/go/units"
 )
 
+// restoreDurationDescription is the shared description of the two WAL restore
+// duration percentile panels, which differ only in their time window.
+const restoreDurationDescription = "50th/90th/99th-percentile time PostgreSQL waited on the plugin for each " +
+	"successfully restored WAL file, per instance (pod). It covers the plugin serving the request, not the " +
+	"replay that follows nor prefetch downloads that finished in the background. Prefetch hits (a local " +
+	"rename) and misses (a wait on a download) are pooled, so with a high hit ratio the misses only show " +
+	"in the upper percentiles; see the prefetch hit ratio and wait share panels for their weight."
+
 // clientPanels returns the "Client / Plugin" section panels. These metrics are
 // emitted by the Klio plugin sidecar that runs in each PostgreSQL pod: the
 // backup lifecycle (`klio.plugin.backup.*`, exported to Prometheus as
 // `klio_plugin_backup_*`) and the WAL streaming client it supervises as a
-// child process (`klio.client.wal.*`, exported as `klio_client_wal_*`). Both
-// families carry a cluster_name, so every panel groups by cluster_name and is
-// scoped by $namespace and $cluster; nothing folds several clusters that share
-// a namespace into a single value.
+// child process (`klio.client.wal.*`, exported as `klio_client_wal_*`), and
+// the WAL restores it serves to PostgreSQL (`klio.plugin.wal.*`, exported as
+// `klio_plugin_wal_*`). All three families carry a cluster_name, so every
+// panel groups by cluster_name and is scoped by $namespace and $cluster;
+// nothing folds several clusters that share a namespace into a single value.
 func clientPanels() []sizedPanel {
 	return []sizedPanel{
 		sized(gridWidth, descriptionPanelHeight, descriptionPanel(
-			"Backup lifecycle and WAL streaming as seen by the plugin sidecar running in each PostgreSQL pod.")),
+			"Backup lifecycle, WAL streaming and WAL restore as seen by the plugin sidecar running in each "+
+				"PostgreSQL pod.")),
 		// Backup activity.
 		// Current backup state, grouped by cluster so a namespace hosting
 		// several clusters shows one series each instead of a folded total.
@@ -149,5 +159,72 @@ func clientPanels() []sizedPanel {
 					clientMatcher, "{{cluster_name}}")...,
 			).Description("50th/90th/99th-percentile duration of the client's gRPC send of a WAL block to the "+
 				"server, per cluster. Reflects all activity since the server last restarted.")),
+
+		// WAL restore. Every RESTORE_WAL request the plugin serves to PostgreSQL
+		// records klio.plugin.wal.restore_duration. Restores are per instance:
+		// each pod's plugin sidecar restores its own WAL through its own
+		// prefetch spool, so these panels split by k8s_pod_name, which the
+		// sidecar always sets from POD_NAME, rather than pooling a cluster's
+		// replicas together. The percentiles keep only successful restores and
+		// pool prefetch hits and misses: how much each kind weighs is in the
+		// hit ratio and wait share panels, not in two unrelated latency lines.
+		sized(largestPanelWidth, largePanelHeight,
+			timeseriesPanel("WAL restore duration percentiles (rate)", units.Nanoseconds,
+				quantileTargets("klio_plugin_wal_restore_duration_nanoseconds_bucket", "le, cluster_name, k8s_pod_name",
+					"outcome=\"success\","+clientMatcher, "{{k8s_pod_name}}")...,
+			).Description(restoreDurationDescription+" Reflects recent activity, over the rate interval window.")),
+
+		sized(largestPanelWidth, largePanelHeight,
+			timeseriesPanel("WAL restore duration percentiles (total)", units.Nanoseconds,
+				quantileTargetsAbsolute("klio_plugin_wal_restore_duration_nanoseconds_bucket",
+					"le, cluster_name, k8s_pod_name", "outcome=\"success\","+clientMatcher,
+					"{{k8s_pod_name}}")...,
+			).Description(restoreDurationDescription+" Reflects all activity since the plugin sidecar last "+
+				"restarted.")),
+
+		sized(mediumPanelWidth, mediumPanelHeight, timeseriesPanel("WAL restores (rate)", units.OpsPerSecond,
+			query(fmt.Sprintf("sum by (cluster_name, k8s_pod_name, tier, outcome) "+
+				"(rate(klio_plugin_wal_restore_duration_nanoseconds_count{%s}[$__rate_interval]))", clientMatcher),
+				"{{k8s_pod_name}} {{tier}} / {{outcome}}"),
+		).Description("Rate of WAL restores served by the plugin to PostgreSQL, per instance (pod), split by the tier "+
+			"that served them and by outcome. not_found is PostgreSQL asking for a WAL that was never archived, "+
+			"the routine end-of-archive signal rather than an error.")),
+
+		sized(mediumPanelWidth, mediumPanelHeight, timeseriesPanel("WAL restores (total)", units.Number,
+			query(fmt.Sprintf("sum by (cluster_name, k8s_pod_name, tier, outcome) "+
+				"(klio_plugin_wal_restore_duration_nanoseconds_count{%s})", clientMatcher),
+				"{{k8s_pod_name}} {{tier}} / {{outcome}}"),
+		).Description("Total WAL restores served by the plugin to PostgreSQL since the plugin sidecar last "+
+			"restarted, per instance (pod), split by the tier that served them and by outcome.")),
+
+		sized(mediumPanelWidth, mediumPanelHeight, timeseriesPanel("WAL restore prefetch hit ratio", units.PercentUnit,
+			// Computed from misses, not hits: the cache_hit="true" series does
+			// not exist until the first hit, which would leave the panel empty
+			// instead of at 0%. The cache_hit="false" series always exists once
+			// a restore succeeded, because prefetch only starts after a
+			// successful restore, so the first one of every plugin sidecar (and
+			// so of every pod) is a miss.
+			query(fmt.Sprintf("1 - sum by (cluster_name, k8s_pod_name) (rate(klio_plugin_wal_restore_duration_nanoseconds_count"+
+				"{outcome=\"success\",cache_hit=\"false\",%[1]s}[$__rate_interval])) / "+
+				"sum by (cluster_name, k8s_pod_name) (rate(klio_plugin_wal_restore_duration_nanoseconds_count"+
+				"{outcome=\"success\",%[1]s}[$__rate_interval]))", clientMatcher),
+				"{{k8s_pod_name}}"),
+		).Description("Fraction of successful WAL restores served straight from the prefetch spool instead of "+
+			"waiting on a download, per instance (pod). A falling ratio means prefetch is not keeping pace with "+
+			"PostgreSQL replay.")),
+
+		sized(mediumPanelWidth, mediumPanelHeight, timeseriesPanel("WAL restore wait share", units.PercentUnit,
+			// rate() of the summed durations is the seconds spent in restores
+			// per second of wall-clock time, i.e. the fraction of time the
+			// pod's PostgreSQL was blocked on the plugin. All outcomes count:
+			// a failed or not_found restore is waited on too.
+			query(fmt.Sprintf("sum by (cluster_name, k8s_pod_name) "+
+				"(rate(klio_plugin_wal_restore_duration_nanoseconds_sum{%s}[$__rate_interval])) / 1e9", clientMatcher),
+				"{{k8s_pod_name}}"),
+		).Description("Fraction of wall-clock time PostgreSQL spent waiting on the plugin for WAL files, per "+
+			"instance (pod). The rest of the time goes to replaying the restored WAL and to starting each "+
+			"restore_command, which the restore duration does not include, so the restore rate is set by replay, "+
+			"not by the restore duration. Near 0% recovery is limited by replay; a high share means "+
+			"PostgreSQL is waiting on downloads.")),
 	}
 }

@@ -25,7 +25,14 @@ The dashboard is a single dashboard split into row sections:
   and the backup success ratio. Also the WAL
   streaming client the sidecar supervises as a child process: the PostgreSQL
   timeline it is currently streaming and the p50/p90/p99 latency of sending
-  a WAL block to the server.
+  a WAL block to the server. Finally the WAL restores the plugin serves back
+  to PostgreSQL, per instance (pod), since each instance restores its own WAL
+  through its own prefetch spool: the p50/p90/p99 restore duration (how long
+  PostgreSQL waited for each WAL file, not the replay that follows), as both
+  a rolling-window and a since-restart total variant, the restore rate and
+  total by tier and outcome, the prefetch hit ratio, and the share of time
+  PostgreSQL spent waiting on the plugin (near 0% when recovery is limited by
+  replay, not by Klio).
 
 ![Klio client and plugin metrics](images/klio_client_and_plugin_metrics.png)
 
@@ -64,6 +71,16 @@ from the alerting guidance in [OpenTelemetry](opentelemetry.md):
   tier 1 (local disk) and tier 2 (remote storage). Read together with the
   staleness panel, it tells a slow pipeline (timestamps advancing, gap
   growing) apart from a stalled one (timestamps and LSN both frozen).
+
+One more is a statistical caveat rather than an alerting signal:
+
+- **WAL restore duration percentiles** pool prefetch hits, a local rename,
+  and misses, a wait on a download, which are orders of magnitude apart. With
+  a high hit ratio the lower percentiles describe hits, around a
+  millisecond, and misses only show in the upper percentiles. Read them
+  together with the **WAL restore prefetch hit ratio**, whose fall over time
+  means prefetch is no longer keeping up with replay on that instance, and
+  the **WAL restore wait share**, which shows how much the waiting costs.
 
 ## Prerequisites
 

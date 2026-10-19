@@ -51,6 +51,9 @@ const (
 	OutcomeSuccess Outcome = "success"
 	// OutcomeFailure marks the failure flavor of an operation counter.
 	OutcomeFailure Outcome = "failure"
+	// OutcomeNotFound marks an operation that completed normally but found
+	// nothing to act on.
+	OutcomeNotFound Outcome = "not_found"
 )
 
 // Attribute returns the `outcome` attribute for this outcome.
@@ -138,6 +141,11 @@ const (
 	// AttributeKeyPath is the attribute key for the WAL data-flow path (put or
 	// get) of a per-block WAL duration histogram.
 	AttributeKeyPath AttributeKey = "path"
+	// AttributeKeyCacheHit is the attribute key for whether a plugin WAL restore
+	// was served from a prefetch already complete in the spool (true) or had to
+	// wait on a download (false). A prefetch still in flight when PostgreSQL
+	// asks counts as false, because the restore waits for that download.
+	AttributeKeyCacheHit AttributeKey = "cache_hit"
 )
 
 // Of builds an OTEL string attribute with the attribute key and the given value.
