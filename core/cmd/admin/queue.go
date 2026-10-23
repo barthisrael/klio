@@ -20,10 +20,10 @@ SPDX-License-Identifier: Apache-2.0
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"path"
 
 	"github.com/spf13/cobra"
 
@@ -46,25 +46,17 @@ var queueStatusCmd = &cobra.Command{
 	Short: "Show the status of the task queue (pending backups and pending WALs)",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		socketPath, err := cmd.Flags().GetString("socket-path")
-		if err != nil {
-			return fmt.Errorf("while getting the socketPath flag: %w", err)
-		}
-
 		jsonOutput, err := cmd.Flags().GetBool("json")
 		if err != nil {
 			return fmt.Errorf("while getting the json flag: %w", err)
 		}
 
-		conn, err := connectToAdminServer(socketPath)
+		adminClient, closeConn, err := dialAdmin(cmd)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			_ = conn.Close()
-		}()
+		defer closeConn()
 
-		adminClient := klioGRPC.NewAdminClient(conn)
 		status, err := adminClient.QueueStatus(cmd.Context(), &klioGRPC.QueueStatusRequest{})
 		if err != nil {
 			return fmt.Errorf("while calling queue-status entrypoint: %w", err)
@@ -89,12 +81,88 @@ var queueStatusCmd = &cobra.Command{
 	},
 }
 
+// failedTaskTarget selects the failed tasks a retry or discard command acts on.
+// A nil cluster name selects every cluster, and empty WAL names select every
+// WAL of the cluster.
+type failedTaskTarget struct {
+	clusterName *string
+	walNames    []string
+}
+
+// failedTaskArgs validates the positional arguments of a retry or discard
+// command: none are allowed with --all-clusters, otherwise withoutAllClusters
+// applies.
+func failedTaskArgs(withoutAllClusters cobra.PositionalArgs) cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		allClusters, err := cmd.Flags().GetBool("all-clusters")
+		if err != nil {
+			return fmt.Errorf("while getting the all-clusters flag: %w", err)
+		}
+		if allClusters {
+			return cobra.NoArgs(cmd, args)
+		}
+
+		return withoutAllClusters(cmd, args)
+	}
+}
+
+// runFailedTaskAction parses the target of a retry or discard command,
+// connects to the administration server and runs action against it.
+func runFailedTaskAction(
+	cmd *cobra.Command,
+	args []string,
+	action func(ctx context.Context, client klioGRPC.AdminClient, target failedTaskTarget) error,
+) error {
+	allClusters, err := cmd.Flags().GetBool("all-clusters")
+	if err != nil {
+		return fmt.Errorf("while getting the all-clusters flag: %w", err)
+	}
+
+	var target failedTaskTarget
+	if !allClusters {
+		clusterName := args[0]
+		target.clusterName = &clusterName
+		if len(args) > 1 {
+			target.walNames = args[1:]
+		}
+	}
+
+	adminClient, closeConn, err := dialAdmin(cmd)
+	if err != nil {
+		return err
+	}
+	defer closeConn()
+
+	return action(cmd.Context(), adminClient, target)
+}
+
+// printDiscarded reports how many failed tasks a discard command removed,
+// as JSON when the --json flag is set.
+func printDiscarded(cmd *cobra.Command, discarded uint64, kind string) error {
+	jsonOutput, err := cmd.Flags().GetBool("json")
+	if err != nil {
+		return fmt.Errorf("while getting the json flag: %w", err)
+	}
+
+	if !jsonOutput {
+		_, _ = fmt.Fprintf(os.Stdout, "Discarded %d failed %s task(s)\n", discarded, kind)
+
+		return nil
+	}
+
+	data, err := json.MarshalIndent(map[string]uint64{"discarded": discarded}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("while marshalling JSON output: %w", err)
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "%s\n", data)
+
+	return nil
+}
+
 //nolint:gochecknoinits
 func init() {
 	AdminCmd.AddCommand(queueCmd)
 	queueCmd.AddCommand(queueStatusCmd)
 
-	socketPath := path.Join(os.TempDir(), ".klio-admin")
-	queueCmd.PersistentFlags().String("socket-path", socketPath, "Unix socket used by the administration server")
 	queueCmd.PersistentFlags().Bool("json", false, "Output in JSON format")
 }

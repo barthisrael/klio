@@ -20,6 +20,7 @@ SPDX-License-Identifier: Apache-2.0
 package admin
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -44,11 +45,6 @@ var listFailedBackupCmd = &cobra.Command{
 	Short: "List failed backup tasks in the queue",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		socketPath, err := cmd.Flags().GetString("socket-path")
-		if err != nil {
-			return fmt.Errorf("while getting the socketPath flag: %w", err)
-		}
-
 		jsonOutput, err := cmd.Flags().GetBool("json")
 		if err != nil {
 			return fmt.Errorf("while getting the json flag: %w", err)
@@ -59,15 +55,12 @@ var listFailedBackupCmd = &cobra.Command{
 			return fmt.Errorf("while getting the cluster-name flag: %w", err)
 		}
 
-		conn, err := connectToAdminServer(socketPath)
+		adminClient, closeConn, err := dialAdmin(cmd)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			_ = conn.Close()
-		}()
+		defer closeConn()
 
-		adminClient := klioGRPC.NewAdminClient(conn)
 		response, err := adminClient.QueueListFailedBackups(cmd.Context(), &klioGRPC.QueueListFailedBackupsRequest{
 			ClusterName: &clusterName,
 		})
@@ -109,49 +102,48 @@ var retryBackupCmd = &cobra.Command{
 		"A cluster name is required, and all failed backup tasks for that cluster " +
 		"are retried. Pass --all-clusters instead of a cluster name to retry all " +
 		"failed backup tasks across every cluster.",
-	Args: func(cmd *cobra.Command, args []string) error {
-		allClusters, err := cmd.Flags().GetBool("all-clusters")
-		if err != nil {
-			return fmt.Errorf("while getting the all-clusters flag: %w", err)
-		}
-		if allClusters {
-			return cobra.NoArgs(cmd, args)
-		}
-
-		return cobra.ExactArgs(1)(cmd, args)
-	},
+	Args: failedTaskArgs(cobra.ExactArgs(1)),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		socketPath, err := cmd.Flags().GetString("socket-path")
-		if err != nil {
-			return fmt.Errorf("while getting the socketPath flag: %w", err)
-		}
+		return runFailedTaskAction(cmd, args,
+			func(ctx context.Context, client klioGRPC.AdminClient, target failedTaskTarget) error {
+				if _, err := client.QueueRetryBackups(ctx, &klioGRPC.QueueRetryBackupsRequest{
+					ClusterName: target.clusterName,
+				}); err != nil {
+					return fmt.Errorf("while calling queue retry backups entrypoint: %w", err)
+				}
 
-		allClusters, err := cmd.Flags().GetBool("all-clusters")
-		if err != nil {
-			return fmt.Errorf("while getting the all-clusters flag: %w", err)
-		}
+				return nil
+			})
+	},
+}
 
-		conn, err := connectToAdminServer(socketPath)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = conn.Close()
-		}()
+//nolint:gochecknoglobals
+var discardBackupCmd = &cobra.Command{
+	Use:   "discard [cluster-name]",
+	Short: "Discard failed backup tasks in the queue",
+	Long: "Discard failed backup tasks in the queue.\n\n" +
+		"A cluster name is required, and all failed backup tasks for that cluster " +
+		"are discarded. Pass --all-clusters instead of a cluster name to discard all " +
+		"failed backup tasks across every cluster.\n\n" +
+		"Discarding removes the failed task from the queue, not the backup " +
+		"itself. The task is permanent: the backup skips its post-backup " +
+		"processing and is never verified or relayed to Tier 2 by that task. " +
+		"Use \"klio admin queue backup list-failed\" to review the failed " +
+		"backup tasks first.\n\n" +
+		"The number of discarded tasks is printed when the command completes.",
+	Args: failedTaskArgs(cobra.ExactArgs(1)),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runFailedTaskAction(cmd, args,
+			func(ctx context.Context, client klioGRPC.AdminClient, target failedTaskTarget) error {
+				resp, err := client.QueueDiscardBackups(ctx, &klioGRPC.QueueDiscardBackupsRequest{
+					ClusterName: target.clusterName,
+				})
+				if err != nil {
+					return fmt.Errorf("while calling queue discard backups entrypoint: %w", err)
+				}
 
-		var request klioGRPC.QueueRetryBackupsRequest
-		if !allClusters {
-			clusterName := args[0]
-			request.ClusterName = &clusterName
-		}
-
-		adminClient := klioGRPC.NewAdminClient(conn)
-		_, err = adminClient.QueueRetryBackups(cmd.Context(), &request)
-		if err != nil {
-			return fmt.Errorf("while calling queue retry backups entrypoint: %w", err)
-		}
-
-		return nil
+				return printDiscarded(cmd, resp.GetDiscarded(), "backup")
+			})
 	},
 }
 
@@ -164,4 +156,7 @@ func init() {
 
 	queueBackupCmd.AddCommand(retryBackupCmd)
 	retryBackupCmd.Flags().Bool("all-clusters", false, "Retry failed backup tasks across every cluster")
+
+	queueBackupCmd.AddCommand(discardBackupCmd)
+	discardBackupCmd.Flags().Bool("all-clusters", false, "Discard failed backup tasks across every cluster")
 }
